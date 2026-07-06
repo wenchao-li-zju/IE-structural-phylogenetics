@@ -1,0 +1,189 @@
+###############################################################
+# analysis.R
+#
+# Data and code for:
+# "Genuine but unstable: the phylogenetic signal of
+#  corpus-derived structural metrics in Indo-European"
+# Wenchao Li & Haitao Liu
+#
+# This script documents the analysis pipeline: phylogenetic
+# signal testing, feature selection, discretization, tree
+# comparison, and the matched lexical baseline. Bayesian and ML
+# tree inference themselves are run externally (MrBayes, IQ-TREE 2)
+# on the .nex matrices; see notes in Section 6 below.
+###############################################################
+
+library(ape)
+library(phytools)
+library(geiger)
+library(phangorn)
+
+## ---- 1. Load data and reference tree ----
+
+d <- read.csv("data/metrics75.csv", check.names = FALSE)
+rownames(d) <- d[[1]]; d[[1]] <- NULL   # first column: language / treebank name
+
+# Reference topology: uncontroversial IE subgroupings (Glottolog / Clackson 2007)
+ref <- read.tree(text =
+  "((((English,(German,Dutch)),(Romanian,(French,(Spanish,Italian)))),
+     (Lithuanian,((Czech,Polish),Russian))),
+    ((Hindi,Persian),(Armenian,(Greek,Irish))));")
+
+
+## ---- 2. Missingness filter (metrics >25% missing are dropped) ----
+
+miss_rate <- colMeans(is.na(d) | d == "")
+dropped   <- names(miss_rate[miss_rate > 0.25])
+cat("Dropped (>25% missing):", dropped, "\n")     # DDir_dislocated (50%)
+dm <- d[, miss_rate <= 0.25, drop = FALSE]        # 74 metrics retained
+# DDir_expl sits exactly at 25% and is retained.
+
+
+## ---- 3. Phylogenetic signal tests: Pagel's lambda & Blomberg's K ----
+
+res <- data.frame(feature = colnames(dm),
+                  lambda = NA, lambda_p = NA, K = NA, K_p = NA)
+
+for (i in seq_along(colnames(dm))) {
+  x <- as.numeric(dm[, i]); names(x) <- rownames(dm)
+  x <- x[!is.na(x)]
+  if (length(x) < 4) next
+  tr <- keep.tip(ref, names(x))
+
+  # Pagel's lambda: ML estimate, likelihood-ratio test against lambda = 0
+  fitL <- try(phylosig(tr, x, method = "lambda", test = TRUE), silent = TRUE)
+  if (!inherits(fitL, "try-error")) {
+    res$lambda[i]   <- fitL$lambda
+    res$lambda_p[i] <- fitL$P
+  }
+
+  # Blomberg's K: permutation test (999 replicates)
+  fitK <- try(phylosig(tr, x, method = "K", test = TRUE, nsim = 999), silent = TRUE)
+  if (!inherits(fitK, "try-error")) {
+    res$K[i]   <- fitK$K
+    res$K_p[i] <- fitK$P
+  }
+}
+
+# Benjamini-Hochberg FDR correction
+res$lambda_FDR <- p.adjust(res$lambda_p, method = "BH")
+res$K_FDR      <- p.adjust(res$K_p,      method = "BH")
+
+write.csv(res, "output/AppendixE_signal_tests_74.csv", row.names = FALSE)
+
+
+## ---- 4. Feature selection ----
+
+# Strict: significant under BOTH tests at FDR < 0.05
+strict    <- res$feature[res$lambda_FDR < 0.05 & res$K_FDR < 0.05]
+# Relaxed: significant under EITHER test at FDR < 0.1
+relaxed19 <- res$feature[res$lambda_FDR < 0.1  | res$K_FDR < 0.1]
+# Cleaned relaxed: remove the two convention-contaminated aggregate indices
+relaxed17 <- setdiff(relaxed19, c("DDir_global", "DDir_balance"))
+
+cat("strict (", length(strict), "):", strict, "\n")
+cat("relaxed19 (", length(relaxed19), ")\n")
+cat("relaxed17 (", length(relaxed17), ")\n")
+
+
+## ---- 5. Discretization into B ordered states (quantile bins) ----
+
+discretize <- function(mat, B = 4) {
+  apply(mat, 2, function(col) {
+    br <- quantile(col, probs = seq(0, 1, length.out = B + 1), na.rm = TRUE)
+    as.integer(cut(col, breaks = unique(br), include.lowest = TRUE,
+                   labels = FALSE)) - 1L
+  })
+}
+# Matrices at B = 3, 4, 5 were exported to NEXUS (see .nex files) for
+# external inference. B = 4 is the main analysis; B = 3, 5 are the
+# discretization-sensitivity check (Appendix F).
+
+
+## ---- 6. External tree inference (run outside R) ----
+#
+# Bayesian (MrBayes 3.2.7), per matrix:
+#   lset coding = variable rates = gamma;
+#   mcmc ngen = 3000000 samplefreq = 500 nchains = 4 nruns = 2;
+#   burn-in = 25%; majority-rule consensus.
+#
+# Maximum likelihood (IQ-TREE 2):
+#   iqtree2 -s MATRIX.nex -st MORPH -m MK -B 1000
+#
+# Convergence: PSRF ~ 1.00, min ESS > 4000; ASDSF reported per run.
+
+
+## ---- 7. Read consensus trees and compute Robinson-Foulds distance ----
+
+# Treebank-ID -> language name. Two encodings are used:
+labmap19 <- c("1"="English","2"="German","3"="Dutch","4"="French","5"="Spanish",
+              "6"="Italian","7"="Romanian","8"="Russian","9"="Polish","10"="Czech",
+              "11"="Hindi","12"="Persian","13"="Lithuanian","14"="Irish",
+              "15"="Greek","16"="Armenian")
+
+labmap17 <- c("1"="Armenian","2"="Lithuanian","3"="Irish","4"="German","5"="English",
+              "6"="Dutch","7"="Greek","8"="Persian","9"="Hindi","10"="Spanish",
+              "11"="French","12"="Italian","13"="Romanian","14"="Czech",
+              "15"="Polish","16"="Russian")
+
+read_con <- function(f, labmap) {
+  raw <- readLines(f)
+  tl  <- grep("tree con", raw, value = TRUE)
+  nwk <- gsub("\\[[^]]*\\]", "", sub(".*= \\[&U\\] ", "", tl))
+  tr  <- read.tree(text = nwk)
+  tr$tip.label <- labmap[tr$tip.label]
+  tr
+}
+
+# Posterior probabilities can be recovered by keeping the prob annotations:
+read_con_pp <- function(f, labmap) {
+  raw  <- readLines(f)
+  tl   <- grep("tree con", raw, value = TRUE)
+  nwk  <- sub(".*= \\[&U\\] ", "", tl)
+  nwk  <- gsub("\\[&prob=([0-9.eE+-]+)[^]]*\\]", "\\1", nwk)
+  tr   <- read.tree(text = nwk)
+  tr$tip.label <- labmap[tr$tip.label]
+  tr
+}
+
+# Example (adjust paths to the unzipped run directories):
+# tr19 <- read_con("trees/relaxed19_B4.con.tre", labmap19)
+# tr17 <- read_con("trees/relaxed17_B4.con.tre", labmap17)
+# cat("19-set RF:", RF.dist(tr19, ref, normalize = TRUE), "\n")  # 0.769
+# cat("17-set RF:", RF.dist(tr17, ref, normalize = TRUE), "\n")  # 0.615
+
+
+## ---- 8. Matched lexical baseline (IE-CoR) ----
+#
+# Cognate data for the same 16 languages were taken from IE-CoR
+# (Anderson et al. 2025; https://iecor.clld.org), restricted to the
+# 170 core-vocabulary meanings. For each meaning, each language's
+# primary lexeme was coded by its cognate-set ID. The matrix `cogmat`
+# thus has 16 rows (languages) and 170 columns (meanings), each cell a
+# cognate-class integer.
+#
+# To reproduce: download IE-CoR v1.2 from https://iecor.clld.org,
+# select the 16 study languages, and build cogmat from the cognate-set
+# assignments (forms.csv joined to cognates.csv).
+#
+# cogmat <- read.csv("data/IE-CoR_16langs_cognates.csv", row.names = 1)
+
+set.seed(1)
+lexical_RF <- replicate(100, {
+  idx <- sample(ncol(cogmat), 19)              # 19 concepts: matched budget
+  sub <- cogmat[, idx, drop = FALSE]
+  # cap each concept at 4 states, to match the structural discretization
+  sub <- apply(sub, 2, function(col) {
+    tb   <- sort(table(col), decreasing = TRUE)
+    keep <- names(tb)[1:min(4, length(tb))]
+    col[!(col %in% keep)] <- NA
+    as.integer(factor(col))
+  })
+  d  <- dist.gene(sub, method = "pairwise")
+  tr <- nj(d); tr$tip.label <- rownames(cogmat)
+  RF.dist(tr, ref, normalize = TRUE)
+})
+
+cat("Lexical baseline RF: median", round(median(lexical_RF), 3),
+    " range", paste(round(range(lexical_RF), 3), collapse = "-"), "\n")
+# Expected: median 0.385, range 0.077-0.615
